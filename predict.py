@@ -74,7 +74,7 @@ class Predictor(BasePredictor):
                 default=None),
             return_embeddings: bool = Input(
                 description="Return representative speaker embeddings",
-                default=True),
+                default=False),
             debug: bool = Input(
                     description="Print out compute/inference times and memory usage information",
                     default=False)
