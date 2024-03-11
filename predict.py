@@ -4,9 +4,9 @@ from itertools import groupby
 
 from whisperx import load_audio
 from whisperx.audio import SAMPLE_RATE
-
-os.environ['HF_HOME'] = '/src/hf_models'
-os.environ['TORCH_HOME'] = '/src/torch_models'
+# Better define XDG_CACHE_HOME as env variable in the docker container
+# os.environ['HF_HOME'] = '/src/hf_models'
+# os.environ['TORCH_HOME'] = '/src/torch_models'
 from cog import BasePredictor, Input, Path, BaseModel
 from pydub import AudioSegment
 from typing import Any, Optional, Union
