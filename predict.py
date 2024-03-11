@@ -1,297 +1,198 @@
+import os
+import time
+from itertools import groupby
+
+from whisperx import load_audio
+from whisperx.audio import SAMPLE_RATE
+
+os.environ['HF_HOME'] = '/src/hf_models'
+os.environ['TORCH_HOME'] = '/src/torch_models'
 from cog import BasePredictor, Input, Path, BaseModel
 from pydub import AudioSegment
-from typing import Any
-from whisperx.audio import N_SAMPLES, log_mel_spectrogram
-
-import gc
-import math
-import os
-import shutil
-import whisperx
-import tempfile
-import time
+from typing import Any, Optional, Union
 import torch
+import whisperx
+import faster_whisper
+import numpy as np
+import pandas as pd
+from pyannote.audio import Pipeline
 
 compute_type = "float16"  # change to "int8" if low on GPU mem (may reduce accuracy)
 device = "cuda"
-whisper_arch = "./models/faster-whisper-large-v3"
-
 
 class Output(BaseModel):
     segments: Any
+    embeddings: Any
     detected_language: str
-
 
 class Predictor(BasePredictor):
     def setup(self):
-        source_folder = './models/vad'
-        destination_folder = '../root/.cache/torch'
-        file_name = 'whisperx-vad-segmentation.bin'
+        """Load the model into memory to make running multiple predictions efficient"""
+        self.device = "cuda"
+        asr_options = {
+            "temperatures": [int(os.getenv("TEMPERATURE", "0"))],
+            "initial_prompt": os.getenv("INITIAL_PROMPT", None)
+        }
 
-        os.makedirs(destination_folder, exist_ok=True)
-
-        source_file_path = os.path.join(source_folder, file_name)
-        if os.path.exists(source_file_path):
-            destination_file_path = os.path.join(destination_folder, file_name)
-
-            if not os.path.exists(destination_file_path):
-                shutil.copy(source_file_path, destination_folder)
-
+        vad_options = {
+            "vad_onset": float(os.getenv("VAD_ONSET", "0.500")),
+            "vad_offset": float(os.getenv("VAD_OFFSET", "0.363"))
+        }
+        self.model = whisperx.load_model(os.getenv("WHISPER_MODEL", "tiny"), self.device,
+                                         language=os.getenv("LANG", "fr"), compute_type=compute_type,
+                                         asr_options=asr_options, vad_options=vad_options)
+        self.alignment_model, self.metadata = whisperx.load_align_model(language_code=os.getenv("LANG", "fr"),
+                                                                        device=self.device)
+        self.diarize_model = DiarizationWithEmbeddingsPipeline(model_name='pyannote/speaker-diarization-3.1',
+                                                          use_auth_token=os.getenv("HF_TOKEN"), device=device)
     def predict(
             self,
             audio_file: Path = Input(description="Audio file"),
-            language: str = Input(
-                description="ISO code of the language spoken in the audio, specify None to perform language detection",
-                default=None),
-            language_detection_min_prob: float = Input(
-                description="If language is not specified, then the language will be detected recursively on different "
-                            "parts of the file until it reaches the given probability",
-                default=0
-            ),
-            language_detection_max_tries: int = Input(
-                description="If language is not specified, then the language will be detected following the logic of "
-                            "language_detection_min_prob parameter, but will stop after the given max retries. If max "
-                            "retries is reached, the most probable language is kept.",
-                default=5
-            ),
             initial_prompt: str = Input(
                 description="Optional text to provide as a prompt for the first window",
                 default=None),
-            batch_size: int = Input(
-                description="Parallelization of input audio transcription",
-                default=64),
             temperature: float = Input(
                 description="Temperature to use for sampling",
                 default=0),
-            vad_onset: float = Input(
-                description="VAD onset",
-                default=0.500),
-            vad_offset: float = Input(
-                description="VAD offset",
-                default=0.363),
+            batch_size: int = Input(
+                description="Parallelization of input audio transcription",
+                default=64),
             align_output: bool = Input(
                 description="Aligns whisper output to get accurate word-level timestamps",
-                default=False),
+                default=True),
             diarization: bool = Input(
                 description="Assign speaker ID labels",
-                default=False),
-            huggingface_access_token: str = Input(
-                description="To enable diarization, please enter your HuggingFace token (read). You need to accept "
-                            "the user agreement for the models specified in the README.",
-                default=None),
+                default=True),
+            group_adjacent_speakers: bool = Input(
+                description="Group adjacent segments with same speakers",
+                default=True),
             min_speakers: int = Input(
                 description="Minimum number of speakers if diarization is activated (leave blank if unknown)",
                 default=None),
             max_speakers: int = Input(
                 description="Maximum number of speakers if diarization is activated (leave blank if unknown)",
                 default=None),
+            return_embeddings: bool = Input(
+                description="Return representative speaker embeddings",
+                default=True),
             debug: bool = Input(
-                description="Print out compute/inference times and memory usage information",
-                default=False)
+                    description="Print out compute/inference times and memory usage information",
+                    default=False)
     ) -> Output:
+        """Run a single prediction on the model"""
         with torch.inference_mode():
-            asr_options = {
-                "temperatures": [temperature],
-                "initial_prompt": initial_prompt
-            }
-
-            vad_options = {
-                "vad_onset": vad_onset,
-                "vad_offset": vad_offset
-            }
-
-            audio_duration = get_audio_duration(audio_file)
-
-            if language is None and language_detection_min_prob > 0 and audio_duration > 30000:
-                segments_duration_ms = 30000
-
-                language_detection_max_tries = min(
-                    language_detection_max_tries,
-                    math.floor(audio_duration / segments_duration_ms)
-                )
-
-                segments_starts = distribute_segments_equally(audio_duration, segments_duration_ms,
-                                                              language_detection_max_tries)
-
-                print("Detecting languages on segments starting at " + ', '.join(map(str, segments_starts)))
-
-                detected_language_details = detect_language(audio_file, segments_starts, language_detection_min_prob,
-                                                            language_detection_max_tries, asr_options, vad_options)
-
-                detected_language_code = detected_language_details["language"]
-                detected_language_prob = detected_language_details["probability"]
-                detected_language_iterations = detected_language_details["iterations"]
-
-                print(f"Detected language {detected_language_code} ({detected_language_prob:.2f}) after "
-                      f"{detected_language_iterations} iterations.")
-
-                language = detected_language_details["language"]
-
-            start_time = time.time_ns() / 1e6
-
-            model = whisperx.load_model(whisper_arch, device, compute_type=compute_type, language=language,
-                                        asr_options=asr_options, vad_options=vad_options)
-
-            if debug:
-                elapsed_time = time.time_ns() / 1e6 - start_time
-                print(f"Duration to load model: {elapsed_time:.2f} ms")
-
-            start_time = time.time_ns() / 1e6
-
+            new_asr_options = self.model.options._asdict()
+            if (initial_prompt and new_asr_options["initial_prompt"] != initial_prompt) or temperature not in \
+                    new_asr_options[
+                        "temperatures"]:
+                new_asr_options["initial_prompt"] = initial_prompt
+                new_asr_options["temperatures"] = [temperature]
+                new_options = faster_whisper.transcribe.TranscriptionOptions(**new_asr_options)
+                self.model.options = new_options
             audio = whisperx.load_audio(audio_file)
-
-            if debug:
-                elapsed_time = time.time_ns() / 1e6 - start_time
-                print(f"Duration to load audio: {elapsed_time:.2f} ms")
-
-            start_time = time.time_ns() / 1e6
-
-            result = model.transcribe(audio, batch_size=batch_size)
+            result = self.model.transcribe(audio, batch_size=batch_size)
             detected_language = result["language"]
-
-            if debug:
-                elapsed_time = time.time_ns() / 1e6 - start_time
-                print(f"Duration to transcribe: {elapsed_time:.2f} ms")
-
-            gc.collect()
-            torch.cuda.empty_cache()
-            del model
-
             if align_output:
                 if detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_TORCH or detected_language in whisperx.alignment.DEFAULT_ALIGN_MODELS_HF:
-                    result = align(audio, result, debug)
+                    result = self.align(audio, result, debug)
                 else:
                     print(f"Cannot align output as language {detected_language} is not supported for alignment")
 
             if diarization:
-                result = diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers)
-
+                result = self.diarize(audio, result, debug, min_speakers, max_speakers, return_embeddings)
+                if group_adjacent_speakers:
+                    result = self.group_speakers(result, debug)
             if debug:
                 print(f"max gpu memory allocated over runtime: {torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB")
 
+        segments = result["segments"]
+        for segment in segments:
+            segment.pop("words", None)
         return Output(
             segments=result["segments"],
+            embeddings=result.get("embeddings", None),
             detected_language=detected_language
         )
+
+    def group_speakers(self, result, debug):
+        start_time = time.time_ns() / 1e6
+        segments = result["segments"]
+        grouped_segments = []
+        for key, group in groupby(segments, lambda seg: seg.get('speaker', 'Unknown')):
+            segs = list(group)
+            grouped_segment = segs[0]
+            grouped_segment['end'] = segs[-1]['end']
+            grouped_segment['text'] = "\n".join(seg['text'] for seg in segs)
+            grouped_segment.pop('words', None)
+            grouped_segments.append(grouped_segment)
+
+        if debug:
+            elapsed_time = time.time_ns() / 1e6 - start_time
+            print(f"Duration to group speakers: {elapsed_time:.2f} ms")
+
+        result['segments'] = grouped_segments
+        return result
+
+    def align(self, audio, result, debug):
+        start_time = time.time_ns() / 1e6
+        result = whisperx.align(result["segments"], self.alignment_model, self.metadata, audio, device,
+                                return_char_alignments=False)
+
+        if debug:
+            elapsed_time = time.time_ns() / 1e6 - start_time
+            print(f"Duration to align output: {elapsed_time:.2f} ms")
+
+        return result
+
+    def diarize(self, audio, result, debug, min_speakers, max_speakers, return_embeddings):
+        start_time = time.time_ns() / 1e6
+
+        diarize_segments, embeddings = self.diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers, return_embeddings=return_embeddings)
+
+        result = whisperx.assign_word_speakers(diarize_segments, result)
+        if return_embeddings:
+            result['embeddings'] = embeddings
+            print(embeddings)
+
+        if debug:
+            elapsed_time = time.time_ns() / 1e6 - start_time
+            print(f"Duration to diarize segments: {elapsed_time:.2f} ms")
+
+        return result
 
 
 def get_audio_duration(file_path):
     return len(AudioSegment.from_file(file_path))
 
+class DiarizationWithEmbeddingsPipeline:
+    def __init__(
+            self,
+            model_name="pyannote/speaker-diarization-3.1",
+            use_auth_token=None,
+            device: Optional[Union[str, torch.device]] = "cpu",
+    ):
+        if isinstance(device, str):
+            device = torch.device(device)
+        self.model = Pipeline.from_pretrained(model_name, use_auth_token=use_auth_token).to(device)
 
-def detect_language(full_audio_file_path, segments_starts, language_detection_min_prob,
-                    language_detection_max_tries, asr_options, vad_options, iteration=1):
-    model = whisperx.load_model(whisper_arch, device, compute_type=compute_type, asr_options=asr_options,
-                                vad_options=vad_options)
+    def __call__(self, audio: Union[str, np.ndarray], min_speakers=None, max_speakers=None, return_embeddings=False):
+        if isinstance(audio, str):
+            audio = load_audio(audio)
+        audio_data = {
+            'waveform': torch.from_numpy(audio[None, :]),
+            'sample_rate': SAMPLE_RATE
+        }
 
-    start_ms = segments_starts[iteration - 1]
-
-    audio_segment_file_path = extract_audio_segment(full_audio_file_path, start_ms, 30000)
-
-    audio = whisperx.load_audio(audio_segment_file_path)
-
-    model_n_mels = model.model.feat_kwargs.get("feature_size")
-    segment = log_mel_spectrogram(audio[: N_SAMPLES],
-                                  n_mels=model_n_mels if model_n_mels is not None else 80,
-                                  padding=0 if audio.shape[0] >= N_SAMPLES else N_SAMPLES - audio.shape[0])
-    encoder_output = model.model.encode(segment)
-    results = model.model.model.detect_language(encoder_output)
-    language_token, language_probability = results[0][0]
-    language = language_token[2:-2]
-
-    print(f"Iteration {iteration} - Detected language: {language} ({language_probability:.2f})")
-
-    audio_segment_file_path.unlink()
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del model
-
-    detected_language = {
-        "language": language,
-        "probability": language_probability,
-        "iterations": iteration
-    }
-
-    if language_probability >= language_detection_min_prob or iteration >= language_detection_max_tries:
-        return detected_language
-
-    next_iteration_detected_language = detect_language(full_audio_file_path, segments_starts,
-                                                       language_detection_min_prob, language_detection_max_tries,
-                                                       asr_options, vad_options, iteration + 1)
-
-    if next_iteration_detected_language["probability"] > detected_language["probability"]:
-        return next_iteration_detected_language
-
-    return detected_language
+        if not return_embeddings:
+            segments = self.model(audio_data, min_speakers=min_speakers, max_speakers=max_speakers, return_embeddings=False)
+            embeddings = None
+        else:
+            segments, embeddings = self.model(audio_data, min_speakers=min_speakers, max_speakers=max_speakers, return_embeddings=True)
+        diarize_df = pd.DataFrame(segments.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
+        diarize_df['start'] = diarize_df['segment'].apply(lambda x: x.start)
+        diarize_df['end'] = diarize_df['segment'].apply(lambda x: x.end)
+        return diarize_df, embeddings
 
 
-def extract_audio_segment(input_file_path, start_time_ms, duration_ms):
-    input_file_path = Path(input_file_path) if not isinstance(input_file_path, Path) else input_file_path
-
-    audio = AudioSegment.from_file(input_file_path)
-
-    end_time_ms = start_time_ms + duration_ms
-    extracted_segment = audio[start_time_ms:end_time_ms]
-
-    file_extension = input_file_path.suffix
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
-        temp_file_path = Path(temp_file.name)
-        extracted_segment.export(temp_file_path, format=file_extension.lstrip('.'))
-
-    return temp_file_path
 
 
-def distribute_segments_equally(total_duration, segments_duration, iterations):
-    available_duration = total_duration - segments_duration
-
-    if iterations > 1:
-        spacing = available_duration // (iterations - 1)
-    else:
-        spacing = 0
-
-    start_times = [i * spacing for i in range(iterations)]
-
-    if iterations > 1:
-        start_times[-1] = total_duration - segments_duration
-
-    return start_times
-
-
-def align(audio, result, debug):
-    start_time = time.time_ns() / 1e6
-
-    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-    result = whisperx.align(result["segments"], model_a, metadata, audio, device,
-                            return_char_alignments=False)
-
-    if debug:
-        elapsed_time = time.time_ns() / 1e6 - start_time
-        print(f"Duration to align output: {elapsed_time:.2f} ms")
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del model_a
-
-    return result
-
-
-def diarize(audio, result, debug, huggingface_access_token, min_speakers, max_speakers):
-    start_time = time.time_ns() / 1e6
-
-    diarize_model = whisperx.DiarizationPipeline(model_name='pyannote/speaker-diarization@2.1',
-                                                 use_auth_token=huggingface_access_token, device=device)
-    diarize_segments = diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
-
-    result = whisperx.assign_word_speakers(diarize_segments, result)
-
-    if debug:
-        elapsed_time = time.time_ns() / 1e6 - start_time
-        print(f"Duration to diarize segments: {elapsed_time:.2f} ms")
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del diarize_model
-
-    return result
