@@ -188,6 +188,7 @@ class DiarizationWithEmbeddingsPipeline:
             embeddings = None
         else:
             segments, embeddings = self.model(audio_data, min_speakers=min_speakers, max_speakers=max_speakers, return_embeddings=True)
+            embeddings = embeddings.tolist()
         diarize_df = pd.DataFrame(segments.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
         diarize_df['start'] = diarize_df['segment'].apply(lambda x: x.start)
         diarize_df['end'] = diarize_df['segment'].apply(lambda x: x.end)
